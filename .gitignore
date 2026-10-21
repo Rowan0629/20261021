@@ -218,3 +218,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Runtime data (photos + Excel); DATA_DIR in .env should point here or outside the repo
+data/
