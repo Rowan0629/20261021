@@ -1,0 +1,33 @@
+[project]
+name = "troupe-bot"
+version = "0.1.0"
+description = "劇團公演資產庫存管理 Discord agent（本機執行）"
+requires-python = ">=3.12"
+dependencies = [
+    "discord-py>=2.7.1",
+    "openpyxl>=3.1.5",
+    "pillow>=13.0.0",
+    "python-dotenv>=1.2.4",
+]
+
+[project.scripts]
+troupe-bot = "troupe_bot.__main__:main"
+
+[build-system]
+requires = ["uv_build>=0.12.14,<0.13.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-m 'not live'"
+filterwarnings = [
+    "ignore:.audioop. is deprecated:DeprecationWarning",  # discord.py 內部，與我們無關
+]
+markers = [
+    "live: 會真的呼叫 claude -p（花一點額度），預設不跑；用 pytest -m live 執行",
+]

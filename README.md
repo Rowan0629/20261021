@@ -30,9 +30,11 @@ uv run python -m troupe_bot
 
 看到「已上線」就可以到頻道傳照片。按 `Ctrl + C` 停止。
 
+也可以直接雙擊專案資料夾裡的 `啟動bot.bat`（效果一樣）。bot 是跑在你電腦上的程式，**視窗關掉、電腦睡眠或關機，它就下線**。想在登入 Windows 時自動啟動：按 `Win + R` 輸入 `shell:startup`，把 `啟動bot.bat` 的捷徑放進去。不要同時開兩個 bot。
+
 資料都在 `DATA_DIR`（預設 `data/`）：
 
-- `inventory.xlsx`：所有紀錄，新的一筆加在最後。**bot 運作時盡量不要開著它**（Windows 會鎖檔，bot 會在終端機印警告並每 3 秒重試，最多 10 次）；要看請先複製一份。
+- `inventory.xlsx`：所有紀錄，新的一筆加在最後。**bot 運作時盡量不要開著它**（Windows 會鎖檔，bot 會在終端機印警告並每 3 秒重試，共 3 次；還是寫不進去，就先把資料存到 `data/pending/`，回覆上傳者「已收到，會自動補登」，等你把 Excel 關掉後約一分鐘內自動補寫）；要看請先複製一份。
 - `photos/`：照片，檔名 `日期 時間 類別 名稱簡稱.jpg`。
 - `bot.log`：日誌。
 
@@ -52,7 +54,7 @@ uv run python -m troupe_bot
 | 防護 1 | `claude -p` 的檔案範圍隔離：只能碰這一件的暫存資料夾，讀不到 `DATA_DIR` | `src/troupe_bot/claude_client.py` 第 100–103 行 |
 | 防護 2 | 上傳者文字只當資料：寫進檔案，不接進指令 | `src/troupe_bot/claude_client.py` 第 105–109 行 |
 | 防護 3 | 檔名清洗：清掉 `/ \ ..`、冒號等會讓路徑亂跑的字 | `src/troupe_bot/photos.py` 第 98–101 行 |
-| 防護 4 | Excel 公式處理：`= + - @` 開頭的文字存成純文字 | `src/troupe_bot/store.py` 第 90–94 行 |
+| 防護 4 | Excel 公式處理：`= + - @` 開頭的文字存成純文字 | `src/troupe_bot/store.py` 第 125–129 行 |
 
 每一段都是「先放不防護的原始值，防護區塊再覆蓋」，所以把任何一段整個註解掉，程式仍然能跑，只是失去那一層保護。
 
