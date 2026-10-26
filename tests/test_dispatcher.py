@@ -4,11 +4,12 @@ import json
 from dataclasses import dataclass, field
 from datetime import datetime
 
+import discord
 import pytest
 from PIL import Image
 
 from troupe_bot import replies
-from troupe_bot.bot import Dispatcher
+from troupe_bot.bot import ACTIVE, STANDBY, STOPPING, Dispatcher, presence_for
 from troupe_bot.claude_client import RunResult
 from troupe_bot.config import Config
 from troupe_bot.handlers import Services
@@ -46,6 +47,7 @@ class FakeUser:
     id: int
     display_name: str = "小明"
     bot: bool = False
+    guild_permissions: object = None
 
     @property
     def mention(self):
@@ -596,3 +598,195 @@ def test_replying_lend_and_return_through_the_dispatcher(svc):
     assert "王小明" in lend.sent[1].content and "已歸還" in back.sent[1].content
     assert svc.store.all_rows()[0].borrower == "" and runner.texts == []
     assert svc.store.find_by_message(lend.sent[1].id).id == 1
+
+
+# ============================================================ 🆕 聊天室指令上線／下線
+
+
+@dataclass
+class FakePerms:
+    manage_guild: bool
+
+
+def admin(id=1) -> FakeUser:
+    return FakeUser(id, "管理員", guild_permissions=FakePerms(True))
+
+
+def cmd(text, *, author=None, channel_id=CHANNEL) -> FakeMessage:
+    return FakeMessage(text, author=author or admin(), channel_id=channel_id)
+
+
+def test_standby_ignores_photos_mentions_and_replies_silently(svc):
+    archive_msg = archived(svc)
+    photo = photo_msg()
+    ask = FakeMessage("找青花瓷", mentions=[BOT])
+    edit = FakeMessage("放在後台A衣箱", author=FakeUser(8, "阿華"), reference=FakeRef(archive_msg.id), mentions=[BOT])
+    runner = FakeRunner(default=one(VASE))
+
+    async def scenario(d):
+        for m in (photo, ask, edit):
+            await d.on_message(m)
+
+    drive(svc, runner, scenario, start_active=False)
+    assert all(m.reply_calls == [] and m.reactions == set() for m in (photo, ask, edit))
+    assert len(svc.store.all_rows()) == 1 and runner.texts == []  # 只有 archived() 事先建的那一筆
+
+
+def test_admin_online_switches_to_active_and_photos_are_processed(svc):
+    up, photo = cmd("!上線"), photo_msg("放 B區03箱")
+
+    async def scenario(d):
+        await d.on_message(up)
+        assert d.mode == ACTIVE
+        await d.on_message(photo)
+
+    drive(svc, FakeRunner(one(VASE)), scenario, start_active=False)
+    assert up.reply_calls[0]["content"] == replies.ONLINE
+    assert len(svc.store.all_rows()) == 1
+
+
+def test_full_width_exclamation_is_accepted(svc):
+    d = drive(svc, FakeRunner(), lambda d: d.on_message(cmd("！上線")), start_active=False)
+    assert d.mode == ACTIVE
+
+
+def test_command_with_extra_text_is_not_a_command(svc):
+    msg = cmd("!上線 好嗎")
+    d = drive(svc, FakeRunner(), lambda d: d.on_message(msg), start_active=False)
+    assert d.mode == STANDBY and msg.reply_calls == []
+
+
+def test_non_admin_command_is_refused_and_state_unchanged(svc):
+    stranger = FakeUser(7)
+    up, down = cmd("!上線", author=stranger), cmd("!下線", author=stranger)
+    d = drive(svc, FakeRunner(), lambda d: d.on_message(up), start_active=False)
+    assert up.reply_calls[0]["content"] == replies.ADMIN_ONLY and d.mode == STANDBY
+    d = drive(svc, FakeRunner(), lambda d: d.on_message(down))
+    assert down.reply_calls[0]["content"] == replies.ADMIN_ONLY and d.mode == ACTIVE
+
+
+def test_command_from_other_channel_or_a_bot_is_ignored(svc):
+    elsewhere, robot = cmd("!上線", channel_id=1), cmd("!上線", author=FakeUser(1, bot=True))
+
+    async def scenario(d):
+        await d.on_message(elsewhere)
+        await d.on_message(robot)
+
+    d = drive(svc, FakeRunner(), scenario, start_active=False)
+    assert d.mode == STANDBY and elsewhere.reply_calls == [] and robot.reply_calls == []
+
+
+def test_repeated_commands_get_a_plain_answer(svc):
+    again, already = cmd("!上線"), cmd("!下線")
+    d = drive(svc, FakeRunner(), lambda d: d.on_message(again))
+    assert again.reply_calls[0]["content"] == replies.ALREADY_ONLINE and d.mode == ACTIVE
+    d = drive(svc, FakeRunner(), lambda d: d.on_message(already), start_active=False)
+    assert already.reply_calls[0]["content"] == replies.ALREADY_STANDBY and d.mode == STANDBY
+
+
+def test_going_offline_waits_for_running_work_then_replies_offline(svc):
+    gate = asyncio.Event()
+    first, second, down = photo_msg(), photo_msg(), cmd("!下線")
+
+    async def scenario(d):
+        await d.on_message(first)
+        await asyncio.sleep(0.05)  # worker 卡在 gate 裡，第一張還在處理
+        task = asyncio.create_task(d.on_message(down))
+        await asyncio.sleep(0.05)
+        assert d.mode == STOPPING and down.reply_calls == []
+        await d.on_message(second)
+        assert second.reply_calls == [] and second.reactions == set()
+        gate.set()
+        await task
+
+    d = drive(svc, FakeRunner(one(VASE), gate=gate), scenario)
+    assert down.reply_calls[0]["content"] == replies.OFFLINE and d.mode == STANDBY
+    assert len(svc.store.all_rows()) == 1
+
+
+def test_online_during_stopping_cancels_the_shutdown(svc):
+    gate = asyncio.Event()
+    first, down, back = photo_msg(), cmd("!下線"), cmd("!上線", author=admin(2))
+
+    async def scenario(d):
+        await d.on_message(first)
+        await asyncio.sleep(0.05)
+        task = asyncio.create_task(d.on_message(down))
+        await asyncio.sleep(0.05)
+        await d.on_message(back)
+        gate.set()
+        await task
+
+    d = drive(svc, FakeRunner(one(VASE), gate=gate), scenario)
+    assert back.reply_calls[0]["content"] == replies.CANCELLED_OFFLINE
+    assert down.reply_calls == [] and d.mode == ACTIVE
+
+
+def test_offline_again_while_stopping_says_so(svc):
+    gate = asyncio.Event()
+    first, down, again = photo_msg(), cmd("!下線"), cmd("!下線", author=admin(2))
+
+    async def scenario(d):
+        await d.on_message(first)
+        await asyncio.sleep(0.05)
+        task = asyncio.create_task(d.on_message(down))
+        await asyncio.sleep(0.05)
+        await d.on_message(again)
+        gate.set()
+        await task
+
+    drive(svc, FakeRunner(one(VASE), gate=gate), scenario)
+    assert again.reply_calls[0]["content"] == replies.STOPPING_NOW
+
+
+def test_awaiting_timer_is_stopped_in_standby_and_restarted_once_on_going_online(svc):
+    svc.awaiting_timeout = 0.3
+    msg = photo_msg()
+
+    async def scenario(d):
+        await d.on_message(msg)
+        await d.queue.join()
+        await d.on_message(cmd("!下線"))
+        assert d.mode == STANDBY and d._timers == {}
+        await asyncio.sleep(0.5)  # 超過期限，但待命中不會自動分開
+        assert svc.store.all_rows() == []
+        await d.on_message(cmd("!上線"))
+        await asyncio.sleep(0.2)
+        assert len(svc.store.all_rows()) == 2
+        await d.on_message(cmd("!下線"))
+        await d.on_message(cmd("!上線"))
+        await asyncio.sleep(0.2)
+
+    drive(svc, FakeRunner(several(TEAPOT, FAN)), scenario)
+    assert len(svc.store.all_rows()) == 2
+
+
+def test_pending_data_waits_in_standby_and_is_filled_in_after_going_online(svc, monkeypatch):
+    lock_excel(monkeypatch)
+    msg = photo_msg("放 B區03箱")
+    messages = {msg.id: msg}
+
+    async def scenario(d):
+        await d.on_message(msg)
+        await d.queue.join()
+        assert len(svc.pending.all()) == 1
+        await d.on_message(cmd("!下線"))
+        monkeypatch.undo()  # Excel 關掉了
+        await asyncio.sleep(0.3)
+        assert len(svc.pending.all()) == 1 and svc.store.all_rows() == []
+        await d.on_message(cmd("!上線"))
+        await asyncio.sleep(0.3)
+
+    drive(svc, FakeRunner(one(VASE)), scenario, with_loop=True, pending_interval=0.05, lookup=messages.get)
+    assert svc.pending.all() == [] and len(svc.store.all_rows()) == 1
+
+
+def test_standby_shows_idle_with_a_hint():
+    status, activity = presence_for(STANDBY)
+    assert status == discord.Status.idle
+    assert activity.name == "待命中，管理員輸入 !上線"
+
+
+def test_active_and_stopping_show_online_without_activity():
+    assert presence_for(ACTIVE) == (discord.Status.online, None)
+    assert presence_for(STOPPING) == (discord.Status.online, None)

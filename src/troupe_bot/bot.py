@@ -14,6 +14,7 @@ import asyncio
 import logging
 import re
 import time
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Awaitable, Callable
@@ -33,6 +34,28 @@ log = logging.getLogger(__name__)
 HOURGLASS = "⏳"
 QUESTION = "❓"
 _MENTION = re.compile(r"<@[!&]?\d+>")
+
+# bot 的三種狀態：開機一律從待命開始，管理員 !上線 才運作；!下線 會先做完手上的工作（下線中）再回到待命
+STANDBY = "standby"
+ACTIVE = "active"
+STOPPING = "stopping"
+_COMMANDS = {"!上線": "online", "!下線": "offline"}
+
+
+def parse_command(content: str) -> str | None:
+    """內容（去掉 @ 之後）完全等於 !上線 或 !下線 才算指令；全形「！」視為半形。"""
+    return _COMMANDS.get(unicodedata.normalize("NFKC", clean_text(content)))
+
+
+def presence_for(mode: str) -> tuple[discord.Status, discord.CustomActivity | None]:
+    """Discord 上的狀態燈：待命＝黃色閒置並寫明怎麼叫醒，運作與下線中＝綠色線上。"""
+    if mode == STANDBY:
+        return discord.Status.idle, discord.CustomActivity(name="待命中，管理員輸入 !上線")
+    return discord.Status.online, None
+
+
+def is_admin(author) -> bool:
+    return bool(getattr(getattr(author, "guild_permissions", None), "manage_guild", False))
 
 
 def is_image(attachment) -> bool:
@@ -61,8 +84,12 @@ class Dispatcher:
         queue_max: int = QUEUE_MAX,
         lookup: Callable[[int], object | None] | None = None,
         pending_interval: float = PENDING_RETRY_SECONDS,
+        start_active: bool = True,
+        on_mode_change: Callable[[str], Awaitable[None]] | None = None,
     ):
         self.svc = svc
+        self.mode = ACTIVE if start_active else STANDBY
+        self._on_mode_change = on_mode_change
         self.bot_user = bot_user
         self.queue: asyncio.Queue[Job] = asyncio.Queue(maxsize=queue_max)
         self.busy = False
@@ -78,6 +105,13 @@ class Dispatcher:
     async def on_message(self, message) -> None:
         if message.author.bot or message.channel.id != self.svc.cfg.channel_id:
             return  # 只聽指定頻道、不理會 bot（包含自己）
+
+        command = parse_command(message.content)
+        if command is not None:
+            await self._command(message, command)
+            return
+        if self.mode != ACTIVE:
+            return  # 待命或下線中：其餘一律靜默忽略（包含照片）
 
         text = clean_text(message.content)
         images = [a for a in message.attachments if is_image(a)]
@@ -105,6 +139,44 @@ class Dispatcher:
                 await message.reply(replies.NO_QUERY, mention_author=False)
                 return
             await self._enqueue(message, lambda: handle_query(self.svc, QueryRequest(text=text)))
+
+    # ------------------------------------------------------------ 上線／下線
+
+    async def _command(self, message, command: str) -> None:
+        """!上線／!下線：只認管理員，精確比對，不經 AI。"""
+        async def say(text: str) -> None:
+            await message.reply(text, mention_author=False)
+
+        if not is_admin(message.author):
+            await say(replies.ADMIN_ONLY)
+        elif command == "online":
+            if self.mode == ACTIVE:
+                await say(replies.ALREADY_ONLINE)
+                return
+            cancelled = self.mode == STOPPING
+            await self._set_mode(ACTIVE)
+            await self.recover()  # 接續 awaiting/ 的計時與 pending/ 的補登
+            await say(replies.CANCELLED_OFFLINE if cancelled else replies.ONLINE)
+        elif self.mode == STANDBY:
+            await say(replies.ALREADY_STANDBY)
+        elif self.mode == STOPPING:
+            await say(replies.STOPPING_NOW)
+        else:
+            await self._set_mode(STOPPING)
+            self._cancel_all_timers()
+            await self.queue.join()
+            if self.mode != STOPPING:
+                return  # 等待期間被 !上線 取消了
+            await self._set_mode(STANDBY)
+            await say(replies.OFFLINE)
+
+    async def _set_mode(self, mode: str) -> None:
+        self.mode = mode
+        if self._on_mode_change is not None:
+            try:
+                await self._on_mode_change(mode)
+            except Exception:
+                log.exception("更新 Discord 狀態失敗")
 
     async def _ingest(self, message, images, text: str) -> None:
         if len(images) > MAX_PHOTOS_PER_MESSAGE:
@@ -162,6 +234,7 @@ class Dispatcher:
         if record is None:
             return
         delay = max(0.0, record.meta["deadline"] - time.time())
+        self._cancel_timer(record_id)  # recover() 會在每次上線時再呼叫，不能留下重複的計時器
         self._timers[record_id] = asyncio.create_task(self._expire(record_id, delay))
 
     async def _expire(self, record_id: str, delay: float) -> None:
@@ -198,7 +271,7 @@ class Dispatcher:
     async def pending_loop(self) -> None:
         while True:
             await asyncio.sleep(self.pending_interval)
-            if self.svc.pending.all():
+            if self.mode == ACTIVE and self.svc.pending.all():
                 self._queue_flush()
 
     def _queue_flush(self) -> None:
@@ -286,10 +359,13 @@ class Dispatcher:
                 self.busy = False
                 self.queue.task_done()
 
-    def close(self) -> None:
+    def _cancel_all_timers(self) -> None:
         for timer in self._timers.values():
             timer.cancel()
         self._timers.clear()
+
+    def close(self) -> None:
+        self._cancel_all_timers()
 
     # ------------------------------------------------------------ 回覆
 
@@ -352,17 +428,26 @@ class TroupeBot(discord.Client):
 
     async def on_ready(self) -> None:
         if self.dispatcher is None:
-            self.dispatcher = Dispatcher(self.svc, bot_user=self.user, lookup=self._find_message)
+            # 一律從待命開始；awaiting/、pending/ 的接續留到管理員 !上線 時才做（Dispatcher.recover）
+            self.dispatcher = Dispatcher(
+                self.svc, bot_user=self.user, lookup=self._find_message,
+                start_active=False, on_mode_change=self._apply_presence,
+            )
             self._background = [
                 asyncio.create_task(self.dispatcher.worker()),
                 asyncio.create_task(self.dispatcher.pending_loop()),
             ]
-            await self.dispatcher.recover()
+        await self._apply_presence(self.dispatcher.mode)  # 重新連線後狀態燈才會跟著目前狀態
         channel = self.get_channel(self.svc.cfg.channel_id)
         if channel is None:
             log.warning("看不到 CHANNEL_ID 指定的頻道：請確認 ID 正確，且 bot 已加入那個 Server 並有「檢視頻道」權限")
         else:
-            log.info("已上線：%s，監聽頻道 #%s", self.user, getattr(channel, "name", "?"))
+            log.info("已連線（%s）：%s，監聽頻道 #%s。管理員在頻道輸入 !上線 才會開始處理",
+                     "運作中" if self.dispatcher.mode == ACTIVE else "待命中", self.user, getattr(channel, "name", "?"))
+
+    async def _apply_presence(self, mode: str) -> None:
+        status, activity = presence_for(mode)
+        await self.change_presence(status=status, activity=activity)
 
     async def on_message(self, message) -> None:
         if not message.author.bot:  # 診斷用：不管是不是監聽頻道都留一筆，才知道 bot 到底有沒有收到

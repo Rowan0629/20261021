@@ -20,6 +20,13 @@ TOO_BIG = "照片太大了（單張上限 10 MB），請縮小後再傳"
 PENDING_NOTICE = "已收到，Excel 目前被占用，會在關閉後自動補登，不用重傳"
 NOT_LENT = "這件目前沒有借出"
 LOAN_NEED_NAME = "請寫借出人，例如：借出 王小明"
+ONLINE = "已上線"
+ALREADY_ONLINE = "已經在運作中"
+OFFLINE = "已下線"
+ALREADY_STANDBY = "目前就是待命中"
+ADMIN_ONLY = "只有伺服器管理員可以上線／下線"
+CANCELLED_OFFLINE = "已取消下線，繼續運作"
+STOPPING_NOW = "正在下線，等手上的工作做完"
 
 
 def fit(text: str, limit: int = DISCORD_LIMIT) -> str:
